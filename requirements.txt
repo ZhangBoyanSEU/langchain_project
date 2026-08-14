@@ -1,0 +1,12 @@
+langchain
+langchain-openai
+langchain-huggingface
+langchain-unstructured
+langchain-text-splitters
+langchain-classic
+chromadb
+sentence-transformers
+unstructured
+langchain_chroma
+python-docx
+langchain-ollama

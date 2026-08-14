@@ -20,11 +20,14 @@ from langchain_chroma import Chroma
 
 def _get_embeddings():
     # os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     return HuggingFaceEmbeddings(
         model_name="BAAI/bge-small-zh-v1.5",
+        model_kwargs={"device": device},
         encode_kwargs={"normalize_embeddings": True}
     )
-
 
 def _generate_ids(chunks):
     """根据文本内容生成确定性ID，相同内容产生相同ID，实现去重(upsert)"""

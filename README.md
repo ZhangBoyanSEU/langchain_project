@@ -4,7 +4,7 @@
 
 ## langchain知识库问答个人demo
 
-## environment prepare
+## 一、环境准备
 1. Ollama download
 ```
 https://ollama.com/download

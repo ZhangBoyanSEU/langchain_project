@@ -240,12 +240,8 @@ def clean_folder(folder_path, output_dir=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="docx 文件数据清洗工具")
-    parser.add_argument("input_path", help="docx 文件路径或包含 docx 文件的文件夹路径")
-    parser.add_argument(
-        "-o", "--output-dir",
-        default=None,
-        help="输出目录（默认: 在原文件同目录下生成 _cleaned 后缀文件）",
-    )
+    parser.add_argument("input_path", default="./data/origin",help="docx 文件路径或包含 docx 文件的文件夹路径，默认读取data/origin文件夹")
+    parser.add_argument("output-dir", default="./data/processed", help="输出目录（默认在/data/processed目录下生成 _cleaned 后缀文件）")
     args = parser.parse_args()
 
     input_path = Path(args.input_path)

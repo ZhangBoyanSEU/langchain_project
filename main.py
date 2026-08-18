@@ -6,7 +6,7 @@ from langchain_classic.chains.combine_documents import create_stuff_documents_ch
 from langchain_openai import ChatOpenAI          # 使用 OpenAI
 from langchain_ollama import ChatOllama    # 使用本地 Ollama
 
-from document_processor import load_vectorstore
+from data_processor import load_vectorstore
 
 
 def create_qa_chain(vectorstore):

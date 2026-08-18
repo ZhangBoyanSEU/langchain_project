@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import hashlib
 import argparse
 from pathlib import Path
@@ -28,6 +29,7 @@ def _get_embeddings():
         model_kwargs={"device": device},
         encode_kwargs={"normalize_embeddings": True}
     )
+
 
 def _generate_ids(chunks):
     """根据文本内容生成确定性ID，相同内容产生相同ID，实现去重(upsert)"""
@@ -159,9 +161,12 @@ def load_document(file_path):
     else:
         raise ValueError("仅支持 .md/.markdown/.docx/.knowledge 文件")
 
-def build_vectorstore(docs, persist_dir="./chroma_db"):
-    """将文档分块、向量化并存入 Chroma"""
-    # 1. 按 split_method 分流：markdown 文件用 Markdown 结构划分，其他用递归字符划分
+def split_to_chunks(docs):
+    """按 split_method 分流切分文档，返回文本块列表。
+
+    - markdown 文件用 MarkdownHeaderTextSplitter 先按标题结构划分，再用 RecursiveCharacterTextSplitter 控制大小
+    - 其他文档直接用 RecursiveCharacterTextSplitter 切分
+    """
     md_docs = [d for d in docs if d.metadata.get("split_method") == "markdown"]
     non_md_docs = [d for d in docs if d.metadata.get("split_method") != "markdown"]
     chunks = []
@@ -199,11 +204,51 @@ def build_vectorstore(docs, persist_dir="./chroma_db"):
 
     unique_count = len(set(c.page_content for c in chunks))
     print(f"共切分为 {len(chunks)} 个文本块（其中 {unique_count} 个唯一内容）")
+    return chunks
 
-    # 2. 生成确定性ID（基于内容哈希），相同内容ID相同，实现upsert去重
+
+def save_chunks_to_jsonl(chunks, jsonl_path):
+    """将文本块列表保存为 JSONL 文件，每行一个 chunk，含 id/page_content/metadata。"""
+    jsonl_path = Path(jsonl_path)
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+
     ids = _generate_ids(chunks)
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for chunk, chunk_id in zip(chunks, ids):
+            record = {
+                "id": chunk_id,
+                "page_content": chunk.page_content,
+                "metadata": chunk.metadata,
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    # 3. 创建/加载向量库
+    print(f"已保存 {len(chunks)} 个文本块至 {jsonl_path}")
+    return jsonl_path
+
+
+def load_chunks_from_jsonl(jsonl_path):
+    """从 JSONL 文件加载文本块，返回 (chunks, ids)。"""
+    jsonl_path = Path(jsonl_path)
+    chunks = []
+    ids = []
+
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            chunks.append(
+                Document(page_content=record["page_content"], metadata=record["metadata"])
+            )
+            ids.append(record["id"])
+
+    print(f"从 {jsonl_path} 加载了 {len(chunks)} 个文本块")
+    return chunks, ids
+
+
+def build_vectorstore_from_chunks(chunks, ids, persist_dir="./chroma_db"):
+    """将已切分的文本块向量化并存入 Chroma。"""
     if os.path.exists(persist_dir):
         print("检测到已有向量库，追加/更新文档...")
         vectorstore = Chroma(
@@ -222,26 +267,80 @@ def build_vectorstore(docs, persist_dir="./chroma_db"):
         )
     return vectorstore
 
-def process_folder(folder_path, persist_dir="./chroma_db"):
-    """处理文件夹中的所有文档（md/docx/knowledge）并存入向量库"""
-    folder = Path(folder_path)
-    if not folder.is_dir():
-        raise ValueError(f"路径不是文件夹: {folder_path}")
+
+def build_vectorstore(docs, persist_dir="./chroma_db"):
+    """将文档分块、向量化并存入 Chroma（兼容旧接口）。"""
+    chunks = split_to_chunks(docs)
+    ids = _generate_ids(chunks)
+    return build_vectorstore_from_chunks(chunks, ids, persist_dir)
+
+def process_folder(folder_path, persist_dir="./chroma_db", jsonl_dir="./data/chunks", mode="all"):
+    """处理文件夹中的所有文档（md/docx/knowledge）。
+
+    Args:
+        folder_path: 包含知识文档的文件夹路径
+        persist_dir: 向量库持久化路径
+        jsonl_dir: JSONL 文件输出/读取目录
+        mode: 处理模式
+            "all"       — 分割保存 JSONL + 向量化（默认）
+            "split"     — 仅分割并保存为 JSONL，不向量化
+            "vectorize" — 仅从 JSONL 加载并向量化，不读取原始文档
+    """
+    if mode not in ("all", "split", "vectorize"):
+        raise ValueError(f"不支持的模式: {mode}，可选: all / split / vectorize")
 
     supported_exts = (".md", ".markdown", ".docx", ".knowledge")
-    files = [f for f in folder.iterdir() if f.suffix.lower() in supported_exts]
-    if not files:
-        raise ValueError(f"文件夹中未找到支持的文档: {folder_path}")
 
-    print(f"找到 {len(files)} 个文档")
-    all_docs = []
-    for file_path in files:
-        print(f"正在加载: {file_path.name}")
-        docs = load_document(str(file_path))
-        all_docs.extend(docs)
+    if mode in ("all", "split"):
+        folder = Path(folder_path)
+        if not folder.is_dir():
+            raise ValueError(f"路径不是文件夹: {folder_path}")
 
-    print(f"共加载 {len(all_docs)} 个文档片段")
-    return build_vectorstore(all_docs, persist_dir)
+        files = [f for f in folder.iterdir() if f.suffix.lower() in supported_exts]
+        if not files:
+            raise ValueError(f"文件夹中未找到支持的文档: {folder_path}")
+
+        print(f"找到 {len(files)} 个文档")
+        all_chunks = []
+        for file_path in files:
+            print(f"正在加载: {file_path.name}")
+            docs = load_document(str(file_path))
+            chunks = split_to_chunks(docs)
+            jsonl_path = Path(jsonl_dir) / f"{file_path.stem}.jsonl"
+            save_chunks_to_jsonl(chunks, jsonl_path)
+            if mode == "all":
+                all_chunks.extend(chunks)
+
+        if mode == "split":
+            print("仅分割模式完成，跳过向量化。")
+            return None
+
+        ids = _generate_ids(all_chunks)
+        print(f"共 {len(all_chunks)} 个文本块待向量化")
+        return build_vectorstore_from_chunks(all_chunks, ids, persist_dir)
+
+    else:  # mode == "vectorize"
+        jsonl_folder = Path(jsonl_dir)
+        if not jsonl_folder.is_dir():
+            raise FileNotFoundError(
+                f"JSONL 目录不存在: {jsonl_dir}，请先以 split 或 all 模式生成"
+            )
+
+        jsonl_files = sorted(jsonl_folder.glob("*.jsonl"))
+        if not jsonl_files:
+            raise ValueError(f"JSONL 目录中未找到 .jsonl 文件: {jsonl_dir}")
+
+        print(f"找到 {len(jsonl_files)} 个 JSONL 文件")
+        all_chunks = []
+        all_ids = []
+        for jsonl_path in jsonl_files:
+            print(f"正在加载: {jsonl_path.name}")
+            chunks, ids = load_chunks_from_jsonl(jsonl_path)
+            all_chunks.extend(chunks)
+            all_ids.extend(ids)
+
+        print(f"共 {len(all_chunks)} 个文本块待向量化")
+        return build_vectorstore_from_chunks(all_chunks, all_ids, persist_dir)
 
 def load_vectorstore(persist_dir="./chroma_db"):
     """加载已有的向量库"""
@@ -253,9 +352,12 @@ def load_vectorstore(persist_dir="./chroma_db"):
     )
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="处理文档（md/docx/knowledge）并存入向量数据库")
-    parser.add_argument("--folder_path", default="./data", help="包含知识文档的文件夹路径")
+    parser = argparse.ArgumentParser(description="处理文档（md/docx/knowledge）：分割为 JSONL 和/或向量化入库")
+    parser.add_argument("--folder_path", default="./data/origin", help="包含知识文档的文件夹路径")
+    parser.add_argument("--jsonl-dir", default="./data/chunks", help="JSONL 文件输出/读取目录 (默认: ./data/chunks)")
+    parser.add_argument("--mode", choices=["all", "split", "vectorize"], default="all",
+                        help="处理模式: all=分割+向量化(默认), split=仅分割保存JSONL, vectorize=仅从JSONL向量化")
     parser.add_argument("--persist-dir", default="./chroma_db", help="向量库持久化路径 (默认: ./chroma_db)")
     args = parser.parse_args()
 
-    process_folder(args.folder_path, args.persist_dir)
+    process_folder(args.folder_path, args.persist_dir, args.jsonl_dir, args.mode)

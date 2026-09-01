@@ -1,0 +1,38 @@
+# 检索链构建原理
+用户问题 → Retriever(检索) → 相关文档 → Stuff Chain(拼+答) → 回答。
+本质上就是标准的 RAG 范式：先检索再生成，用检索到的知识库内容约束 LLM 的回答范围。这里用的是最简单的 Stuff 策略（全量塞入），适合 top-k 较少（k=3）的场景；如果文档很多，通常会改用 Map-Reduce 或 Refine 策略来避免超出上下文窗口。
+
+# 组件原理
+整个链由两个子链组合而成：
+## 1. 检索器（Retriever）
+retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+- 将 ChromaDB 向量库转为检索器
+- k=3：取与问题嵌入向量最相似的 top-3 个文本块
+- 相似度计算基于 BAAI/bge-small-zh-v1.5 嵌入向量的余弦相似度（构建时已 normalize_embeddings=True）
+
+## 2. 文档组合链（Stuff Documents Chain）
+combine_docs_chain = create_stuff_documents_chain(llm_ollama, prompt)
+- Stuff 策略：将检索到的 3 个文档全部"塞入"（stuff）到 prompt 的 {context} 占位符中
+- Prompt 模板约束模型"基于上下文回答，无相关信息则说不知道"，防止幻觉
+- LLM 为本地 Ollama 的 qwen2.5，temperature=0 保证回答确定性
+
+## 3. 检索链组装（Retrieval Chain）
+return create_retrieval_chain(retriever, combine_docs_chain)
+- create_retrieval_chain 将上述两个子链串联为一个完整链
+- 调用 qa_chain.invoke({"input": query}) 时，内部执行顺序：
+  1. 用户问题传入 retriever → 检索 top-3 文档
+  2. 检索结果自动填充到 prompt 的 {context}
+  3. 组合后的完整 prompt 送入 LLM 生成回答
+  4. 返回 {"answer": "...", "context": [检索到的文档列表]}
+
+# 数据流示意
+"闪电是怎么形成的？"
+    │
+    ▼
+[bge-small-zh 嵌入] → 向量 → [ChromaDB 余弦相似度排序] → top-3 chunks
+    │
+    ▼
+[stuff 策略] 把 3 个 chunk 填入 prompt 的 {context}
+    │
+    ▼
+[qwen2.5 生成] → "闪电是..." → 返回 {answer, context}

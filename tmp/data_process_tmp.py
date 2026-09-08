@@ -7,13 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
-# 文档加载器
 from langchain_unstructured import UnstructuredLoader
-
-# 文本分割
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
-
-# 文档模型与嵌入模型与向量库
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma

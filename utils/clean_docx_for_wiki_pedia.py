@@ -15,8 +15,10 @@ class DocxCleaner:
       1. Unicode NFC 归一化
       2. 空白字符归一化（制表符、不间断空格、连续空格、首尾空白）
       3. 不可见控制字符移除（零宽字符、BOM 等）
-      4. 超链接解包（保留显示文本，移除链接标记）
-      5. 引用标记删除（[1]、[1-3]、[注 1]、[来源请求] 等）
+      4. 超链接解包（保留显示文本，移除链接标记；同时处理 w:hyperlink
+         元素与 HYPERLINK 域代码两种形式）
+      5. 引用标记删除（[1]、[1-3]、[注 1]、[来源请求]、[需要解释]、
+         ": 508-525" 页码引用等）
       6. 维基百科残留移除（独立成段的"编辑"等 UI 标签）
       7. 空段落移除
       8. 连续重复段落去重
@@ -33,6 +35,7 @@ class DocxCleaner:
             "whitespace_cleaned": 0,
             "control_chars_removed": 0,
             "hyperlinks_unwrapped": 0,
+            "field_hyperlinks_unwrapped": 0,
             "citations_removed": 0,
             "wikipedia_artifacts_removed": 0,
             "empty_paragraphs_removed": 0,
@@ -95,11 +98,94 @@ class DocxCleaner:
             parent.remove(hyperlink)
             self.stats["hyperlinks_unwrapped"] += 1
 
+    def unwrap_field_hyperlinks(self):
+        """解包域代码形式的超链接。
+
+        两种形式：
+          1. 简单域: <w:fldSimple w:instr=" HYPERLINK ...">...</w:fldSimple>
+             —— 保留内部 runs，移除 fldSimple 包装。
+          2. 复杂域: fldChar(begin) -> instrText(HYPERLINK...) ...
+             -> fldChar(separate) -> 结果文本 runs -> fldChar(end)
+             —— 保留 separate 与 end 之间的显示文本，
+                删除指令部分（begin..separate）与 end 标记。
+        """
+        body = self.doc.element.body
+
+        # 1) 简单域 fldSimple
+        for fld in list(body.iter(qn("w:fldSimple"))):
+            instr = fld.get(qn("w:instr")) or ""
+            if not instr.strip().upper().startswith("HYPERLINK"):
+                continue
+            parent = fld.getparent()
+            idx = list(parent).index(fld)
+            runs = fld.findall(qn("w:r"))
+            for offset, run in enumerate(runs):
+                parent.insert(idx + offset, deepcopy(run))
+            parent.remove(fld)
+            self.stats["field_hyperlinks_unwrapped"] += 1
+
+        # 2) 复杂域
+        for p in body.iter(qn("w:p")):
+            self._unwrap_complex_fields_in_paragraph(p)
+
+    def _unwrap_complex_fields_in_paragraph(self, paragraph):
+        runs = list(paragraph.iter(qn("w:r")))
+        to_remove = set()
+        open_fields = []  # 栈: {"begin": run, "hyperlink": bool, "separate": run|None}
+
+        for run in runs:
+            for child in run:
+                tag = child.tag
+                if tag == qn("w:fldChar"):
+                    ftype = child.get(qn("w:fldCharType"))
+                    if ftype == "begin":
+                        open_fields.append(
+                            {"begin": run, "hyperlink": False, "separate": None}
+                        )
+                    elif ftype == "separate":
+                        if open_fields and open_fields[-1]["separate"] is None:
+                            open_fields[-1]["separate"] = run
+                    elif ftype == "end":
+                        if not open_fields:
+                            continue
+                        field = open_fields.pop()
+                        if not field["hyperlink"]:
+                            continue
+                        end_run = run
+                        separate = field["separate"]
+                        # 删除指令部分: begin .. separate（含），无 separate 时
+                        # 整个域（begin .. end）都删除
+                        in_removal = False
+                        for r in runs:
+                            if r is field["begin"]:
+                                in_removal = True
+                            if in_removal:
+                                to_remove.add(r)
+                            if separate is not None and r is separate:
+                                in_removal = False
+                            if r is end_run:
+                                break
+                        if separate is not None:
+                            to_remove.add(end_run)
+                        self.stats["field_hyperlinks_unwrapped"] += 1
+                elif tag == qn("w:instrText"):
+                    if (
+                        open_fields
+                        and open_fields[-1]["separate"] is None
+                        and "HYPERLINK" in (child.text or "").upper()
+                    ):
+                        open_fields[-1]["hyperlink"] = True
+
+        for run in to_remove:
+            run.getparent().remove(run)
+
     def remove_citations(self):
         citation_re = re.compile(
             r'\[\d+(?:[-,\s]+\d+)*\]'
             r'|\[注\s*\d+\]'
             r'|\[来源请求\]'
+            r'|\[需要解释\]'
+            r'|[:\uff1a][\u200a\u2009\u202f]+\d+(?:[-\u2013\u2014,，;][\u200a\u2009\u202f ]*\d+)*'
         )
         punct_re = re.compile(r'[.。]{2,}')
 
@@ -180,6 +266,7 @@ class DocxCleaner:
         self.clean_whitespace()
         self.remove_control_chars()
         self.unwrap_hyperlinks()
+        self.unwrap_field_hyperlinks()
         self.remove_citations()
         self.remove_wikipedia_artifacts()
         self.remove_empty_paragraphs()
@@ -223,7 +310,10 @@ def clean_folder(folder_path, output_dir=None):
     if not folder.is_dir():
         raise ValueError(f"路径不是文件夹: {folder_path}")
 
-    docx_files = [f for f in folder.iterdir() if f.suffix.lower() == ".docx"]
+    docx_files = [
+        f for f in folder.iterdir()
+        if f.suffix.lower() == ".docx" and not f.name.startswith("~$")
+    ]
     if not docx_files:
         print(f"文件夹中未找到 docx 文件: {folder_path}")
         return []
@@ -240,8 +330,8 @@ def clean_folder(folder_path, output_dir=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="docx 文件数据清洗工具")
-    parser.add_argument("input_path", default="./data/origin",help="docx 文件路径或包含 docx 文件的文件夹路径，默认读取data/origin文件夹")
-    parser.add_argument("output-dir", default="./data/processed", help="输出目录（默认在/data/processed目录下生成 _cleaned 后缀文件）")
+    parser.add_argument("--input_path", default="./data/origin",help="docx 文件路径或包含 docx 文件的文件夹路径，默认读取data/origin文件夹")
+    parser.add_argument("--output-dir", default="./data/processed", help="输出目录（默认在/data/processed目录下生成 _cleaned 后缀文件）")
     args = parser.parse_args()
 
     input_path = Path(args.input_path)

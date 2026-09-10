@@ -3,6 +3,14 @@ __pycache__/
 *.py[codz]
 *$py.class
 fundamental_principles/
+.idea/
+
+bge-small-zh-v1.5/
+data/origin
+data/chunks
+data/processed
+chroma_db/
+
 
 # C extensions
 *.so

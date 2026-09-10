@@ -11,6 +11,7 @@ from langchain_ollama import ChatOllama    # 使用本地 Ollama
 from data_processor import load_vectorstore
 
 
+
 def create_map_reduce_documents_chain(llm, map_prompt, reduce_prompt):
     """创建 Map-Reduce 文档组合链。
 
@@ -63,7 +64,7 @@ def create_qa_chain(vectorstore, strategy="stuff"):
     # )
 
     # 方式二：本地 Ollama（需先安装并启动 ollama，且已拉取模型）
-    llm_ollama = ChatOllama(model="qwen2.5", temperature=0)
+    llm_ollama = ChatOllama(model="llama3.2", temperature=0.2)
 
     # Stuff 策略的 Prompt
     stuff_prompt = ChatPromptTemplate.from_template('''

@@ -7,25 +7,20 @@ from pathlib import Path
 
 import numpy as np
 
-# 文档加载器
 from langchain_unstructured import UnstructuredLoader
-
-# 文本分割
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
-
-# 文档模型与嵌入模型与向量库
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
-
 def _get_embeddings():
-    # os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    # os.environ["HF_HUB_OFFLINE"] = "1"
+    # os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     return HuggingFaceEmbeddings(
-        model_name="BAAI/bge-small-zh-v1.5",
+        model_name="./bge-small-zh-v1.5",
         model_kwargs={"device": device},
         encode_kwargs={"normalize_embeddings": True}
     )
@@ -37,6 +32,19 @@ def _generate_ids(chunks):
         hashlib.sha256(chunk.page_content.encode("utf-8")).hexdigest()
         for chunk in chunks
     ]
+
+
+def _dedupe_by_id(chunks, ids):
+    """按 ID 去重，保留首次出现的 (chunk, id) 对。"""
+    seen = {}
+    for chunk, chunk_id in zip(chunks, ids):
+        if chunk_id not in seen:
+            seen[chunk_id] = (chunk, chunk_id)
+    deduped_chunks = [pair[0] for pair in seen.values()]
+    deduped_ids = [pair[1] for pair in seen.values()]
+    if len(deduped_ids) < len(ids):
+        print(f"去重: {len(ids)} -> {len(deduped_ids)} 个文本块（跳过 {len(ids) - len(deduped_ids)} 个重复ID）")
+    return deduped_chunks, deduped_ids
 
 
 class SemanticChunker:
@@ -207,22 +215,51 @@ def split_to_chunks(docs):
     return chunks
 
 
+def _load_existing_ids_from_jsonl(jsonl_path):
+    """读取 JSONL 文件中已有的 id 集合，容错跳过损坏行。"""
+    existing_ids = set()
+    if not jsonl_path.exists():
+        return existing_ids
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                existing_ids.add(record["id"])
+            except (json.JSONDecodeError, KeyError):
+                print(f"警告: 跳过损坏行: {line[:50]}")
+    return existing_ids
+
+
 def save_chunks_to_jsonl(chunks, jsonl_path):
-    """将文本块列表保存为 JSONL 文件，每行一个 chunk，含 id/page_content/metadata。"""
+    """将文本块列表追加写入 JSONL 文件（按 id 去重，同一 id 仅保留一条记录）。"""
     jsonl_path = Path(jsonl_path)
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
     ids = _generate_ids(chunks)
-    with jsonl_path.open("w", encoding="utf-8") as f:
+    chunks, ids = _dedupe_by_id(chunks, ids)
+    existing_ids = _load_existing_ids_from_jsonl(jsonl_path)
+
+    appended = 0
+    skipped = 0
+    with jsonl_path.open("a", encoding="utf-8") as f:
         for chunk, chunk_id in zip(chunks, ids):
+            if chunk_id in existing_ids:
+                skipped += 1
+                continue
             record = {
                 "id": chunk_id,
                 "page_content": chunk.page_content,
                 "metadata": chunk.metadata,
             }
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            existing_ids.add(chunk_id)
+            appended += 1
 
-    print(f"已保存 {len(chunks)} 个文本块至 {jsonl_path}")
+    total = len(_load_existing_ids_from_jsonl(jsonl_path))
+    print(f"已追加 {appended} 个文本块至 {jsonl_path}（跳过重复 {skipped} 条，文件现存 {total} 条）")
     return jsonl_path
 
 
@@ -248,7 +285,8 @@ def load_chunks_from_jsonl(jsonl_path):
 
 
 def build_vectorstore_from_chunks(chunks, ids, persist_dir="./chroma_db"):
-    """将已切分的文本块向量化并存入 Chroma。"""
+    """将已切分的文本块向量化并存入 Chroma（入库前按 ID 去重）。"""
+    chunks, ids = _dedupe_by_id(chunks, ids)
     if os.path.exists(persist_dir):
         print("检测到已有向量库，追加/更新文档...")
         vectorstore = Chroma(
@@ -301,13 +339,13 @@ def process_folder(folder_path, persist_dir="./chroma_db", jsonl_dir="./data/chu
             raise ValueError(f"文件夹中未找到支持的文档: {folder_path}")
 
         print(f"找到 {len(files)} 个文档")
+        combined_jsonl_path = Path(jsonl_dir) / "all_chunks.jsonl"
         all_chunks = []
         for file_path in files:
             print(f"正在加载: {file_path.name}")
             docs = load_document(str(file_path))
             chunks = split_to_chunks(docs)
-            jsonl_path = Path(jsonl_dir) / f"{file_path.stem}.jsonl"
-            save_chunks_to_jsonl(chunks, jsonl_path)
+            save_chunks_to_jsonl(chunks, combined_jsonl_path)
             if mode == "all":
                 all_chunks.extend(chunks)
 
@@ -316,6 +354,7 @@ def process_folder(folder_path, persist_dir="./chroma_db", jsonl_dir="./data/chu
             return None
 
         ids = _generate_ids(all_chunks)
+        all_chunks, ids = _dedupe_by_id(all_chunks, ids)
         print(f"共 {len(all_chunks)} 个文本块待向量化")
         return build_vectorstore_from_chunks(all_chunks, ids, persist_dir)
 
@@ -340,6 +379,7 @@ def process_folder(folder_path, persist_dir="./chroma_db", jsonl_dir="./data/chu
             all_ids.extend(ids)
 
         print(f"共 {len(all_chunks)} 个文本块待向量化")
+        all_chunks, all_ids = _dedupe_by_id(all_chunks, all_ids)
         return build_vectorstore_from_chunks(all_chunks, all_ids, persist_dir)
 
 def load_vectorstore(persist_dir="./chroma_db"):
